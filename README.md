@@ -8,7 +8,21 @@ This is an entry for the [Reactive Omni Buildathon](https://dorahacks.io/hackath
 
 Splitting a paid invoice is still a chore. The client pays one address, then somebody has to notice, do the arithmetic, and send each collaborator their share. A bot can do that, until the laptop sleeps, the key expires, or the process crashes. The people owed money wait on a process that is not part of the agreement.
 
-The agreement can live on-chain instead. The invoice contract holds the client's ETH. A reactive contract on Reactive Omni remembers the invoice, the partial payments, and the agreed percentages. When the paid total reaches the amount due, it asks a destination contract to pay the split. That request is a normal cross-chain callback. Nothing off-chain has to wake up.
+The agreement can live on-chain instead. Whoever fills in the form — a person, or an assistant — only **proposes** the split. The contracts **enforce** it. The path is the one Reactive is built for: an origin event, a reactive contract, persistent state, a deterministic policy, and one gas-bounded callback. Nothing off-chain has to wake up.
+
+## AI proposes, code enforces
+
+The proposal is the invoice: recipients, percentages, amount, and an optional due timestamp. After `createInvoice`, that proposal is the policy. The reactive ledger does not ask anyone what to do next.
+
+| Step | Who | What is fixed |
+| --- | --- | --- |
+| Propose | The user in the UI, or anything that can submit the same transaction | Recipients and basis points. They must sum to 10,000. At most eight. No zero addresses. |
+| Event | InvoiceVault on Base Sepolia | `InvoiceOpened`, then each `PaymentReceived` or `PaymentRefunded`. |
+| State | SplitLedger on Lasna | Invoice id, amount due, partial `paid`, and the stored allocations. Logs are deduped by chain, transaction, and log index. |
+| Policy | SplitLedger | Pay only when `paid >= amountDue`. Amounts are `amountDue * bps / 10000`, with rounding dust on the first recipient. Overpayment is not part of the split. A short invoice never callbacks. |
+| Callback | PayoutRelay, gas limit 800,000 | `msg.sender` must be the Base Sepolia callback proxy. The injected address must be this ledger. The vault pays once. A second callback is a no-op. A recipient that rejects ETH does not unwind the others; that share stays claimable. |
+
+A model can suggest the percentages. It cannot move the ETH. The callback receiver never trusts the payload alone: `onlyServiceProvider` and `onlyCallbackSender` both have to pass, and `settled` is the replay lock.
 
 ## Track and networks
 
@@ -81,7 +95,9 @@ When `configured && paid >= amountDue && !payoutRequested`, the ledger:
 
 Overpayment stays in the vault. The issuer withdraws it after settlement. Underpayment never requests a callback.
 
-`retrySettle` is owner-only, for the case where the destination skipped or reverted (empty reserve, recipient rejected the transfer). The relay treats an already settled invoice as a no-op, so a retry cannot pay twice. The happy path never needs this function, and it does not need a keeper.
+`retrySettle` is owner-only. `poke` is permissionless, with a 30 second timestamp cooldown, because Reactive does not retry a failed callback by itself. The ledger also subscribes to `SplitSettled`. Once that acknowledgement arrives, further pokes do nothing. Until then the relay treats an already settled invoice as a no-op, so a second callback cannot pay twice. The happy path never needs either function, and it does not need a keeper.
+
+The contract was checked with [Reactive MCP](https://dev.reactive.network/reactive-mcp) (`https://mcp.rnk.dev/mcp`) before deploy. `plan_rc` confirmed the topic0 for `InvoiceOpened`, the `settle(address,bytes32,address[],uint256[])` selector `0x64899faa`, and the Base Sepolia callback proxy. `check_rc_source` reported `OK_SOURCE` for `SplitLedger` and `PayoutRelay`. Cursor is pointed at the same server in `.cursor/mcp.json`. `script/check-rc.py` repeats the source check.
 
 ## Destination checks
 
@@ -114,12 +130,23 @@ Filled in after deployment and checked in as `deployments/addresses.json`.
 
 | Contract | Chain | Address |
 | --- | --- | --- |
-| InvoiceVault | Base Sepolia | pending |
-| PayoutRelay | Base Sepolia | pending |
-| SplitLedger | Reactive Lasna | pending |
+| InvoiceVault | Base Sepolia | [`0xE4F30Eb16b7f6699c4B5eb3a8c743eC6C45D55d0`](https://sepolia.basescan.org/address/0xE4F30Eb16b7f6699c4B5eb3a8c743eC6C45D55d0) |
+| PayoutRelay | Base Sepolia | [`0x10386ccF2D3d901245750Ec0f98A6F65790e8973`](https://sepolia.basescan.org/address/0x10386ccF2D3d901245750Ec0f98A6F65790e8973) |
+| SplitLedger | Reactive Lasna | [`0xd94ad58958fc61d01791f00b013c53f1ff01e5ef`](https://lasna.reactscan.net/address/0xd94ad58958fc61d01791f00b013c53f1ff01e5ef) |
 | Deployer | both | `0xDBbEAdC24f292c067D35a70278f62d09c965A0Ac` |
 
-A full loop (origin event, reactive transaction, callback) is recorded in `deployments/loop.json` when the demo payment settles.
+Recorded loop for invoice `0xdf934c446f66073aa93945df0642735ead91dd8de434d643a4c73d065e22b916` (0.0001 testnet ETH, 50/30/20). The same object is in `deployments/addresses.json`.
+
+| Step | Chain | Transaction |
+| --- | --- | --- |
+| Create invoice | Base Sepolia | [`0xd3f1ec79…`](https://sepolia.basescan.org/tx/0xd3f1ec795920d0a9a663fac7ea95d89d48d51a83cfdab2570fc3d70a4864df62) |
+| Partial payment (40%) | Base Sepolia | [`0xb9288c39…`](https://sepolia.basescan.org/tx/0xb9288c39db6d73e5de4a108a389524af159ad738017a0b2e43e9aab2bfe998f9) |
+| Reactive apply, no callback | Lasna | [`0x19892667…`](https://lasna.reactscan.net/tx/0x1989266775520eef0c42bd9a4bf156d700632d152babfa0ddbe964af4ecdc924) |
+| Completing payment | Base Sepolia | [`0x3ba210cb…`](https://sepolia.basescan.org/tx/0x3ba210cbf7f8485665b9f2011cb4775282eccc05a83ba939b0e38f1204e9e487) |
+| Reactive `requestCallbackV_1_0` | Lasna | [`0x9fd8448e…`](https://lasna.reactscan.net/tx/0x9fd8448e2616f1a83a39737921cf4f7705513675a9d951ce67f3a322d19ccb0d) |
+| Callback through the proxy | Base Sepolia | [`0xc15ea223…`](https://sepolia.basescan.org/tx/0xc15ea223032d86adeafc45b0d60a5ec343f89f18436084f683b9628eef3e9cc3) |
+
+The callback is from the Reactive signer to the Base Sepolia callback proxy. The vault emitted `SplitSettled` in that transaction and paid 0.00005, 0.00003, and 0.00002 ETH. A later Lasna transaction acknowledged `SplitSettled`, so `poke` will not fire again.
 
 ## Setup
 
@@ -157,7 +184,7 @@ script/loop.sh
 
 1. **0:00** — "This invoice pays my collaborators when the client finishes paying. I do not run a bot."
 2. **0:15** — Show the three nodes: the vault on Base Sepolia, the ledger on Reactive Lasna, the people on the split. Mention the due date is a timestamp.
-3. **0:30** — Create an invoice. 50% to the freelancer, 30% and 20% to two collaborators. Amount small, testnet ETH only.
+3. **0:30** — Create an invoice. Say it out loud: the form only proposes. 50% to the freelancer, 30% and 20% to two collaborators. The vault will reject the invoice unless those shares sum to 100. Amount small, testnet ETH only.
 4. **0:50** — Pay half. A cyan arc runs from the payer to the vault. The ledger's stored `paid` moves. No payout arcs. "It is not fully paid, so Reactive does nothing outbound."
 5. **1:10** — Pay the rest. The arc thickens. A violet arc runs into the Reactive node, then green arcs fan out to the two collaborators and the freelancer's share.
 6. **1:35** — Point at the three hashes: the completing `pay` on Base, the `react` transaction on Lasna, and the callback that emitted `SplitSettled`. Refresh the recipient balances.
@@ -165,7 +192,7 @@ script/loop.sh
 
 ## Judging map
 
-- **Execution.** The loop is an origin log, a reactive transaction that calls `requestCallbackV_1_0`, and a callback transaction. Hashes live in `deployments/loop.json`.
+- **Execution.** The loop is an origin log, a reactive transaction that calls `requestCallbackV_1_0`, and a callback transaction. Hashes are in the table above and in `deployments/addresses.json`.
 - **Integration.** The reactive contract is the book of record: partial payments, refunds, allocation math, dust, deduplication, and the decision to pay. The relay only checks funds and duplicates, then moves ETH.
 - **Usefulness.** One agreement, many payments, payout while the author is offline.
 - **Craft.** Foundry tests, this note, and a UI that shows the same transactions a judge can open in the explorers.

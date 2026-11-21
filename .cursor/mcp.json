@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "reactive-mcp": {
+      "url": "https://mcp.rnk.dev/mcp"
+    }
+  }
+}
